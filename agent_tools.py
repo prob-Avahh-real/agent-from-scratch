@@ -3,7 +3,10 @@
 阶段 2/3/5 以前各自复制了一份工具代码，这里收敛成唯一一份：
 工具的 Python 实现、给模型看的 JSON Schema、以及执行入口。
 
-只用标准库，方便单独 import / 测试。
+安全边界有两条：
+  1. 所有路径钉死在工作目录 WORKSPACE 内；
+  2. 会话存储目录（memory.SESSION_DIR，默认在工作目录之外）额外加拒绝清单，
+     即使有人把它设到工作区里，模型的文件工具也读不到别的会话。
 """
 
 from __future__ import annotations
@@ -12,7 +15,21 @@ import ast
 import operator
 from pathlib import Path
 
+import memory
+
 WORKSPACE = Path(__file__).resolve().parent
+
+
+def _denied_roots() -> list[Path]:
+    roots = {memory.SESSION_DIR, memory.LEGACY_DIR}
+    return [r.resolve() for r in roots]
+
+
+def _is_denied(p: Path) -> bool:
+    for root in _denied_roots():
+        if p == root or root in p.parents:
+            return True
+    return False
 
 
 # ---------------- 实现 ----------------
@@ -41,10 +58,11 @@ def calculator(expression: str) -> str:
 
 
 def _resolve(path: str) -> Path:
-    """把相对路径钉死在工作目录内，挡掉 ../../etc/passwd 这类越界。"""
     p = (WORKSPACE / path).resolve()
     if WORKSPACE not in p.parents and p != WORKSPACE:
         raise ValueError("只能访问工作目录内的文件")
+    if _is_denied(p):
+        raise ValueError("该路径属于会话存储，工具不可访问（会话隔离）")
     return p
 
 
@@ -52,7 +70,10 @@ def list_dir(path: str = ".") -> str:
     p = _resolve(path)
     if not p.exists():
         return f"路径不存在：{path}"
-    items = sorted(p.iterdir(), key=lambda x: (x.is_file(), x.name))
+    items = sorted(
+        (i for i in p.iterdir() if not _is_denied(i.resolve())),
+        key=lambda x: (x.is_file(), x.name),
+    )
     return "\n".join(f"{'[dir] ' if i.is_dir() else '      '}{i.name}" for i in items) or "（空目录）"
 
 

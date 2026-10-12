@@ -3,8 +3,9 @@
 模型本身是无状态的 —— 它不"记得"任何东西，所谓记忆全靠我们在外面存。
 每个会话落盘成一个 JSON，下次重新起进程时先读回来，于是它看起来"记得"。
 
-存储的完整实现（多会话、摘要压缩、旧文件迁移）都在 memory.py，
-阶段 5 的 05_agent.py 也用的是同一份。
+存储的完整实现（多会话、分层摘要、成本统计、会话隔离）都在 memory.py，
+阶段 5 的 05_agent.py 用的是同一份。会话默认落在工作目录之外，
+所以模型的 read_file 够不着别的会话。
 
 闸门：重启进程后仍记得。
     .venv/bin/python 04_memory.py "我叫小明，记住这个名字"
@@ -47,9 +48,11 @@ def chat(messages: list) -> str:
 
 
 def show_history(session: dict) -> None:
-    if not session["messages"]:
+    if not session["messages"] and not session.get("archive"):
         print("（还没有记忆）")
         return
+    if session.get("archive"):
+        print(f"（归档 {len(session['archive'])} 条，用 05_agent.py --archive 看）")
     for m in session["messages"]:
         icon = {"user": "👤", "assistant": "🤖"}.get(m["role"], m["role"])
         print(f"{icon} {(m.get('content') or '')[:120]}")
@@ -70,9 +73,12 @@ def main() -> None:
     if "--history" in flags:
         show_history(session)
         return
+    if "--stats" in flags:
+        print(memory.stats_report(session))
+        return
 
     prompt = " ".join(words) or "你好，我们之前聊过什么吗？"
-    print(f"（读回 {len(session['messages'])} 条历史）\n")
+    print(f"（读回 {len(session['messages'])} 条活跃、{len(session['archive'])} 条归档）\n")
 
     messages = [
         {"role": "system", "content": SYSTEM},
@@ -82,7 +88,6 @@ def main() -> None:
     ]
     reply = chat(messages)
 
-    # 只存 user / assistant；system 每次现拼
     session["messages"].append({"role": "user", "content": prompt})
     session["messages"].append({"role": "assistant", "content": reply})
     memory.save(session)

@@ -1,27 +1,26 @@
 """阶段 5：打磨 —— 一个能真的拿去用的 agent。
 
-把前面所有东西拼起来，再补上"能真的拿去用"需要的部分：
-
   * 工具调用（阶段 2）   见 agent_tools.py：calculator / list_dir / read_file / write_file
   * ReAct 循环（阶段 3）  想一步 → 调工具拿观察 → 再想，直到不再请调工具
   * 记忆落盘（阶段 4）    见 memory.py：退出重进还在
-  * 多会话（本阶段）      /save /load /sessions，各会话独立落盘
-  * 历史压缩（本阶段）    超阈值时把旧对话压成摘要，上下文不再无限膨胀
-  * 流式输出（本阶段）    边生成边打印，不等整段返回
-  * 错误重试（本阶段）    429 / 5xx / 网络抖动，指数退避自动重试
+  * 分层摘要（本阶段）    活跃窗口 + archive 原文 + 滚动 summary，原文不丢
+  * 多会话（本阶段）      /save /load /rename /delete /new，各会话独立落盘
+  * 成本统计（本阶段）    按会话累计 token 与估算成本，/stats 查看
+  * 会话隔离（本阶段）    会话默认落在工作目录之外，工具层的拒绝清单兜底
+  * 流式输出（本阶段）    边生成边打印
+  * 错误重试（本阶段）    429 / 5xx / 网络抖动，指数退避
   * 交互 REPL（本阶段）   不给 prompt 就进对话模式
 
-流式下最容易翻车的是 tool_calls：它按 index 分片到达，
-同一个 index 的 function.arguments 会一段一段发过来，必须累积拼好再 json.loads。
+流式下最容易翻车的是 tool_calls：它按 index 分片到达，必须累积拼好再 json.loads。
 
 用法：
     .venv/bin/python 05_agent.py "看看目录里有什么"
-    .venv/bin/python 05_agent.py                       # 进 REPL（含会话命令）
-    .venv/bin/python 05_agent.py --session work "..."   # 指定会话
+    .venv/bin/python 05_agent.py                 # 进 REPL
+    .venv/bin/python 05_agent.py --session work "..."
     .venv/bin/python 05_agent.py --list-sessions
-    .venv/bin/python 05_agent.py --history / --summary
-    .venv/bin/python 05_agent.py --reset [--session work]
-    .venv/bin/python 05_agent.py --reset-all
+    .venv/bin/python 05_agent.py --history / --archive / --stats
+    .venv/bin/python 05_agent.py --export out.md
+    .venv/bin/python 05_agent.py --reset [--session work] / --reset-all
     .venv/bin/python 05_agent.py --no-stream "..."
 """
 
@@ -54,14 +53,29 @@ SYSTEM = (
 )
 
 HELP = (
-    "命令：/sessions 列出会话 · /save [名字] 保存（给名字=另存并切换）· "
-    "/load <名字> 切换 · /new [名字] 开新会话 · /reset 清空当前 · "
-    "/summary 看摘要 · /history 看历史 · exit 退出"
+    "命令：/sessions 列出 · /save [名] 保存(给名=另存并切换) · /load <名> 切换 · "
+    "/new [名] 新建 · /rename <名> 重命名 · /delete <名> 删除 · /reset 清空当前 · "
+    "/summary 摘要 · /history 活跃历史 · /archive [n] 归档原文 · /stats 用量成本 · "
+    "/export [文件] 导出 Markdown · exit 退出"
 )
 
 
 class ApiError(RuntimeError):
     pass
+
+
+def fix_argv(argv: list) -> list:
+    """某些非交互 shell 没有 LANG，中文 argv 会以 surrogateescape 解码成孤立代理，
+    一 print 就炸。这里把原始字节按 UTF-8 还原，命令行因此对 locale 免疫。
+    """
+    out = []
+    for a in argv:
+        try:
+            a.encode("utf-8")
+            out.append(a)
+        except UnicodeEncodeError:
+            out.append(a.encode("utf-8", "surrogateescape").decode("utf-8", "replace"))
+    return out
 
 
 def get_api_key() -> str:
@@ -78,7 +92,6 @@ def _headers() -> dict:
 
 
 def post_with_retry(payload: dict, stream: bool):
-    """POST 一个请求，对网络错误和 429/5xx 做指数退避重试。"""
     last_err: Exception | None = None
     for attempt in range(1, MAX_RETRIES + 1):
         try:
@@ -105,10 +118,7 @@ def post_with_retry(payload: dict, stream: bool):
 
 
 def one_call(messages: list, tools: list, stream: bool) -> tuple[dict, str | None, dict | None]:
-    """发一次请求，返回 (assistant 消息, finish_reason, usage)。
-
-    stream=True 时边收边把正文打到 stdout；tool_calls 按 index 分片累积。
-    """
+    """发一次请求，返回 (assistant 消息, finish_reason, usage)。流式时按 index 累积 tool_calls。"""
     payload: dict = {"model": MODEL, "messages": messages, "stream": stream}
     if tools:
         payload["tools"] = tools
@@ -167,19 +177,20 @@ def one_call(messages: list, tools: list, stream: bool) -> tuple[dict, str | Non
     return message, finish, usage
 
 
-# ---------------- 历史压缩 ----------------
-
-def summarize(previous_summary: str, transcript: str) -> str:
-    """把较老的对话压成一段摘要（非流式，不往 stdout 打正文）。"""
-    msg, _, _ = one_call(
-        [
-            {"role": "system", "content": "你是对话摘要器，只输出摘要正文。"},
-            {"role": "user", "content": memory.build_prompt(transcript, previous_summary)},
-        ],
-        [],
-        stream=False,
-    )
-    return (msg.get("content") or "").strip()
+def make_summarizer(session: dict):
+    """返回一个 summarize(prev, transcript)，顺手把摘要这次调用的 token 也记进会话。"""
+    def summarize(previous_summary: str, transcript: str) -> str:
+        msg, _, usage = one_call(
+            [
+                {"role": "system", "content": "你是对话摘要器，只输出摘要正文。"},
+                {"role": "user", "content": memory.build_prompt(transcript, previous_summary)},
+            ],
+            [],
+            stream=False,
+        )
+        memory.record_usage(session, usage)
+        return (msg.get("content") or "").strip()
+    return summarize
 
 
 # ---------------- Agent 主循环 ----------------
@@ -192,13 +203,12 @@ def run_turn(session: dict, prompt: str, stream: bool) -> str:
         {"role": "user", "content": prompt},
     ]
     final = ""
-    total_tokens = 0
+    delta_total = 0.0
     tag = ""
 
     for step in range(1, MAX_STEPS + 1):
         msg, finish, usage = one_call(messages, TOOLS, stream)
-        if usage:
-            total_tokens += usage.get("total_tokens") or 0
+        delta_total += memory.record_usage(session, usage)
         messages.append(msg)
         calls = msg.get("tool_calls") or []
 
@@ -213,7 +223,7 @@ def run_turn(session: dict, prompt: str, stream: bool) -> str:
 
         if msg.get("content"):
             if stream:
-                print()  # 流式正文后换行，工具日志另起
+                print()
             else:
                 print(f"      💬 {msg['content'].strip()}")
         for call in calls:
@@ -234,33 +244,67 @@ def run_turn(session: dict, prompt: str, stream: bool) -> str:
         tag = f"step {MAX_STEPS}, 未终止"
         print(f"⚠️ {final}")
 
-    if total_tokens:
-        print(f"      [tokens] {total_tokens}  ({tag})")
-
-    # 记忆只留 user/assistant 文本：不含 tool 调用，历史干净、不会出现悬空 tool_call_id
     session["messages"].append({"role": "user", "content": prompt})
     session["messages"].append({"role": "assistant", "content": final})
 
-    if memory.trim(session, summarize):
+    if memory.trim(session, make_summarizer(session)):
         print(
-            f"      🗜️ 历史超过 {memory.MAX_MESSAGES} 条，已压缩为摘要"
-            f"（保留最近 {memory.KEEP_RECENT} 条）"
+            f"      🗜️ 活跃窗口超 {memory.MAX_MESSAGES} 条：原文已归档，摘要已刷新"
+            f"（归档 {len(session['archive'])} 条）"
         )
     memory.save(session)
+    print(f"      [{memory.stats_line(session, delta_total)}]  ({tag})")
     return final
 
 
-# ---------------- 会话命令 ----------------
+# ---------------- 会话展示与导出 ----------------
 
 def show_history(session: dict) -> None:
     msgs = session.get("messages", [])
     if not msgs:
-        print("（当前会话还没有历史）")
+        print("（当前会话活跃窗口为空）")
         return
     for m in msgs:
         icon = {"user": "👤", "assistant": "🤖"}.get(m["role"], m["role"])
         print(f"{icon} {(m.get('content') or '')[:120]}")
 
+
+def show_archive(session: dict, limit: int = 10) -> None:
+    archive = session.get("archive") or []
+    if not archive:
+        print("（归档为空）")
+        return
+    shown = archive[-limit:]
+    print(f"（归档共 {len(archive)} 条，显示最后 {len(shown)} 条）")
+    for m in shown:
+        icon = {"user": "👤", "assistant": "🤖"}.get(m["role"], m["role"])
+        print(f"{icon} {(m.get('content') or '')[:120]}")
+
+
+def export_session(session: dict, path: str | None = None) -> None:
+    path = path or f"session-{session['name']}.md"
+    p = (memory.WORKSPACE / path).resolve()
+    if memory.WORKSPACE not in p.parents and p != memory.WORKSPACE:
+        print("导出路径必须在工作目录内。")
+        return
+    lines = [
+        f"# 会话 {session['name']}", "",
+        "## 统计", "", "~~~", memory.stats_report(session), "~~~", "",
+    ]
+    if session.get("summary"):
+        lines += ["## 滚动摘要", "", session["summary"], ""]
+    archive = session.get("archive") or []
+    if archive:
+        lines += [f"## 归档原文（{len(archive)} 条）", ""]
+        lines += [f"- **{m['role']}**: {m.get('content') or ''}" for m in archive]
+        lines += [""]
+    lines += [f"## 活跃窗口（{len(session.get('messages', []))} 条）", ""]
+    lines += [f"- **{m['role']}**: {m.get('content') or ''}" for m in session.get("messages", [])]
+    p.write_text("\n".join(lines), encoding="utf-8")
+    print(f"（已导出到 {path}）")
+
+
+# ---------------- 会话命令 ----------------
 
 def handle_command(session: dict, line: str, stream: bool) -> dict:
     parts = line.split(maxsplit=1)
@@ -282,20 +326,47 @@ def handle_command(session: dict, line: str, stream: bool) -> dict:
             print("用法：/load <名字>")
         else:
             session = memory.load(arg)
-            print(f"（已切到会话 '{session['name']}'：{len(session['messages'])} 条消息）")
+            print(f"（已切到会话 '{session['name']}'：活跃 {len(session['messages'])} 条、"
+                  f"归档 {len(session['archive'])} 条）")
     elif cmd == "/new":
         session = memory.new_session(arg or memory.DEFAULT_SESSION)
         memory.save(session)
         print(f"（新会话 '{session['name']}'）")
+    elif cmd == "/rename":
+        if not arg:
+            print("用法：/rename <新名字>")
+        else:
+            old = session["name"]
+            session["name"] = memory.safe_name(arg)
+            memory.save(session)
+            if old != session["name"]:
+                memory.reset(old)
+            print(f"（'{old}' → '{session['name']}'）")
+    elif cmd == "/delete":
+        if not arg:
+            print("用法：/delete <名字>")
+        elif memory.safe_name(arg) == session["name"]:
+            print("不能删当前会话，先 /load 或 /new 别的；要清空用 /reset。")
+        else:
+            memory.reset(arg)
+            print(f"（已删除会话 '{memory.safe_name(arg)}'）")
     elif cmd == "/reset":
         memory.reset(session["name"])
         session["summary"] = ""
         session["messages"] = []
+        session["archive"] = []
+        session["stats"] = {k: 0 for k in memory.STAT_KEYS} | {"cost": 0.0}
         print("（当前会话已清空）")
     elif cmd == "/summary":
         print(session.get("summary") or "（还没有摘要）")
     elif cmd == "/history":
         show_history(session)
+    elif cmd == "/archive":
+        show_archive(session, int(arg) if arg.isdigit() else 10)
+    elif cmd == "/stats":
+        print(memory.stats_report(session))
+    elif cmd == "/export":
+        export_session(session, arg or None)
     else:
         print(f"未知命令：{cmd}（/help 看帮助）")
     return session
@@ -303,9 +374,10 @@ def handle_command(session: dict, line: str, stream: bool) -> dict:
 
 def repl(session: dict, stream: bool) -> None:
     print(
-        f"（会话 '{session['name']}'：{len(session['messages'])} 条消息"
+        f"（会话 '{session['name']}'：活跃 {len(session['messages'])} 条、"
+        f"归档 {len(session['archive'])} 条"
         + ("，含摘要" if session.get("summary") else "")
-        + "）"
+        + f"；存储 {memory.SESSION_DIR}）"
     )
     print(HELP)
     while True:
@@ -331,16 +403,22 @@ def repl(session: dict, stream: bool) -> None:
 # ---------------- CLI ----------------
 
 def parse_args(argv: list) -> dict:
-    opts = {"stream": True, "session": memory.DEFAULT_SESSION, "flags": set(), "prompt": ""}
+    opts = {
+        "stream": True,
+        "session": memory.DEFAULT_SESSION,
+        "flags": set(),
+        "prompt": "",
+        "export": None,
+    }
     rest: list[str] = []
     i = 0
     while i < len(argv):
         a = argv[i]
-        if a == "--session":
+        if a in {"--session", "--export"}:
             i += 1
             if i >= len(argv):
-                sys.exit("--session 需要一个会话名")
-            opts["session"] = argv[i]
+                sys.exit(f"{a} 需要一个值")
+            opts["session" if a == "--session" else "export"] = argv[i]
         elif a == "--no-stream":
             opts["stream"] = False
         elif a.startswith("--"):
@@ -353,12 +431,14 @@ def parse_args(argv: list) -> dict:
 
 
 def main() -> None:
+    sys.argv = fix_argv(sys.argv)
     opts = parse_args(sys.argv[1:])
     flags = opts["flags"]
 
     if "--list-sessions" in flags:
         names = memory.list_sessions()
         print("会话：" + ("、".join(names) if names else "（还没有）"))
+        print(f"存储目录：{memory.SESSION_DIR}")
         return
     if "--reset-all" in flags:
         print(f"已清空 {memory.reset_all()} 个会话。")
@@ -373,8 +453,14 @@ def main() -> None:
     if "--history" in flags:
         show_history(session)
         return
-    if "--summary" in flags:
-        print(session.get("summary") or "（还没有摘要）")
+    if "--archive" in flags:
+        show_archive(session)
+        return
+    if "--stats" in flags:
+        print(memory.stats_report(session))
+        return
+    if opts["export"]:
+        export_session(session, opts["export"])
         return
 
     if not opts["prompt"]:
