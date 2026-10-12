@@ -1,118 +1,108 @@
-"""阶段 3: ReAct 循环 —— 多轮推理 + 多工具"""                                                                       
-import json                                                                                                         
-import os                                                                                                           
-import requests                                                                                                     
-                                                                                                                         
-API_KEY = os.environ["ZHIPU_API_KEY"]                                                                                        
-URL = "https://open.bigmodel.cn/api/paas/v4/chat/completions"                                                       
-MODEL = "glm-4-flash"                                                                                               
-MAX_ITER = 5  # 最多调 5 次工具，防死循环                                                                           
+"""阶段 3：ReAct 循环。
 
-"""=== 工具们 ==="""                                                                                                      
-def get_weather(city: str) -> str:                                                                                  
-    weather = {                                                                                                     
-        "北京": "晴，25°C，适宜出门",                                                                               
-        "上海": "雨，22°C，建议带伞",                                                                               
-        "深圳": "多云，30°C",                                                                                       
-        "杭州": "多云转晴，27°C",                                                                                   
-    }                                                                                                               
-    return weather.get(city, f"未找到 {city} 的天气")                                                               
-                                                                                                                         
-def get_time(city: str) -> str:                                                                                     
-    times = {                                                                                                       
-        "北京": "15:00",                                                                                            
-        "上海": "15:00",                                                                                            
-        "纽约": "02:00",                                                                                            
-        "伦敦": "08:00",                                                                                            
-    }                                                                                                               
-    return f"{city} 当前时间: {times.get(city, '未知')}"                                                            
-                                                                                                                         
-TOOL_FUNCS = {                                                                                                      
-    "get_weather": get_weather,                                                                                     
-    "get_time": get_time,                                                                                           
-}                                                                                                                   
-                                                                                                                         
-TOOLS = [                                                                                                           
-    {                                                                                                               
-        "type": "function",                                                                                         
-        "function": {                                                                                               
-            "name": "get_weather",                                                                                  
-            "description": "查询指定城市的天气",                                                                    
-            "parameters": {                                                                                         
-                "type": "object",                                                                                   
-                "properties": {                                                                                     
-                    "city": {"type": "string", "description": "城市名"},                                            
-                },                                                                                                  
-                "required": ["city"],                                                                               
-            },                                                                                                      
-        },                                                                                                          
-    },                                                                                                              
-    {                                                                                                               
-        "type": "function",                                                                                         
-        "function": {                                                                                               
-            "name": "get_time",                                                                                     
-            "description": "查询指定城市当前时间",                                                                  
-            "parameters": {                                                                                         
-                "type": "object",                                                                                   
-                "properties": {                                                                                     
-                    "city": {"type": "string", "description": "城市名"},                                            
-                },                                                                                                  
-                "required": ["city"],                                                                               
-            },                                                                                                      
-        },                                                                                                          
-    },                                                                                                              
-]                                                                                                                   
-                                                                                                                         
-def chat(messages: list[dict]) -> dict:                                                                             
-    resp = requests.post(                                                                                           
-        URL,                                                                                                        
-        headers={"Authorization": f"Bearer {API_KEY}"},                                                             
-        json={"model": MODEL, "messages": messages, "tools": TOOLS},                                                
-        timeout=30,                                                                                                 
-    )                                                                                                               
-    resp.raise_for_status()                                                                                         
-    return resp.json()["choices"][0]["message"]                                                                     
-                                                                                                                         
-def run(user_input: str) -> str:                                                                                    
-    messages = [                                                                                                    
-        {"role": "system", "content": "你是助手，能用工具就用工具。"},                                              
-        {"role": "user", "content": user_input},                                                                    
-    ]                                                                                                               
-                                                                                                                         
-    for i in range(MAX_ITER):                                                                                       
-        print(f"\n--- 第 {i+1} 轮 ---")                                                                             
-        msg = chat(messages)                                                                                        
-        messages.append(msg)                                                                                        
-                                                                                                                         
-        # 没有 tool_calls → 任务结束                                                                                
-        if not msg.get("tool_calls"):                                                                               
-            print("LLM 直接给出最终答案")                                                                           
-            return msg["content"]                                                                                   
-                                                                                                                         
-        # 执行所有 tool_calls                                                                                       
-        for call in msg["tool_calls"]:                                                                              
-            fn_name = call["function"]["name"]                                                                      
-            args = json.loads(call["function"]["arguments"])                                                        
-            print(f"  调用工具: {fn_name}({args})")                                                                 
-                                                                                                                         
-            func = TOOL_FUNCS.get(fn_name)                                                                          
-            if func is None:                                                                                        
-                result = f"未知工具: {fn_name}"                                                                     
-            else:                                                                                                   
-                result = func(**args)                                                                                 
-                                                                                                                         
-            print(f"  工具结果: {result}")                                                                          
-            messages.append(                                                                                        
-                {                                                                                                   
-                    "role": "tool",                                                                                 
-                    "tool_call_id": call["id"],                                                                     
-                    "content": result,                                                                              
-                }                                                                                                   
-            )                                                                                                       
-                                                                                                                         
-    return "达到最大迭代次数，任务未完成"                                                                           
-                                                                                                                         
-if __name__ == "__main__":                                                                                                  
-    print(run("北京和上海今天哪个更适合出门？顺便告诉我北京现在几点了")) 
+ReAct = Reasoning + Acting：让模型"想一步 → 调工具拿观察 → 再想一步"，
+循环到它不再请求工具为止。阶段 2 只走了一趟往返，这里把它套进 while。
+
+模型本身是无状态的，所以每一轮都要把【完整历史】重新发过去：
+    user → assistant(tool_calls) → tool(结果) → assistant(tool_calls) → tool → assistant(最终答案)
+
+工具实现见 agent_tools.py。
+
+闸门：多步后正确终止（不再要求调工具，给出自然语言答案）。
+
+跑法：
+    .venv/bin/python 03_react.py
+    .venv/bin/python 03_react.py "算一下 (1234*5678)**2 的末三位"
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import sys
+
+import requests
+
+from agent_tools import TOOLS, execute
+
+BASE_URL = os.environ.get("DEEPSEEK_BASE_URL", "https://api.deepseek.com").rstrip("/")
+CHAT_URL = f"{BASE_URL}/chat/completions"
+MODEL = os.environ.get("DEEPSEEK_MODEL", "deepseek-chat")
+TIMEOUT = 60
 
 
+def get_api_key() -> str:
+    key = os.environ.get("DEEPSEEK_API_KEY")
+    if not key:
+        sys.exit("缺少 DEEPSEEK_API_KEY。先 export（或 source ~/.zshrc）再跑。")
+    return key
+
+
+def chat(messages: list, tools: list | None = None) -> dict:
+    payload: dict = {"model": MODEL, "messages": messages, "stream": False}
+    if tools:
+        payload["tools"] = tools
+    headers = {"Authorization": f"Bearer {get_api_key()}", "Content-Type": "application/json"}
+    resp = requests.post(CHAT_URL, headers=headers, json=payload, timeout=TIMEOUT)
+    if resp.status_code != 200:
+        sys.exit(f"请求失败：HTTP {resp.status_code}\n{resp.text}")
+    return resp.json()
+
+MAX_STEPS = 8
+
+SYSTEM = (
+    "你是一个会用工具解决问题的助手。"
+    "需要读文件、列目录或做算术时，必须调用对应工具，不要凭空猜测。"
+    "拿到足够信息后，用中文简洁地给出最终答案。"
+)
+
+
+def run(question: str) -> str:
+    messages = [
+        {"role": "system", "content": SYSTEM},
+        {"role": "user", "content": question},
+    ]
+    print(f"👤 {question}\n")
+
+    for step in range(1, MAX_STEPS + 1):
+        data = chat(messages, tools=TOOLS)
+        choice = data["choices"][0]
+        msg = choice["message"]
+        calls = msg.get("tool_calls") or []
+        think = (msg.get("content") or "").strip()
+
+        # 干净地回填 assistant 这一轮：只保留协议需要的字段
+        assistant_msg = {"role": "assistant", "content": msg.get("content")}
+        if calls:
+            assistant_msg["tool_calls"] = calls
+        messages.append(assistant_msg)
+
+        if think:
+            print(f"[{step}] 🧠 想：{think}")
+
+        if not calls:
+            print(f"[{step}] ✅ 终止（finish_reason={choice.get('finish_reason')}）\n")
+            return think
+
+        for call in calls:
+            name = call["function"]["name"]
+            try:
+                args = json.loads(call["function"]["arguments"] or "{}")
+            except json.JSONDecodeError:
+                args = {}
+            print(f"[{step}] 🔧 做：{name}({json.dumps(args, ensure_ascii=False)})")
+            result = execute(name, args)
+            preview = result if len(result) <= 160 else result[:160] + " …"
+            print(f"[{step}] 📦 观察：{preview}")
+            messages.append({"role": "tool", "tool_call_id": call["id"], "content": result})
+
+    print(f"⚠️ 达到最大步数 {MAX_STEPS} 仍未终止，强制收尾。")
+    return ""
+
+
+if __name__ == "__main__":
+    default_q = (
+        "先列出当前目录有哪些文件，再读取 01_chat.py 的前 15 行，"
+        "用一句话说明它是干什么的；最后用计算器算 (17*23+5)/6。"
+    )
+    run(" ".join(sys.argv[1:]) or default_q)
