@@ -52,3 +52,18 @@
 - **会话隔离已是真隔离**：会话目录默认在工作目录外，工具层另加拒绝清单。实测 `read_file` / `write_file` 访问会话目录返回 ERROR，`list_dir` 不显示它；把 `AGENT_SESSION_DIR` 设进工作区也一样被拒（这正是隔离测试的用法）
 - 中文 argv 的坑：测试脚本里 `$变量` 紧跟多字节字符（如 `"$m，..."`）时字节会被吞，应直接用字面量；`05_agent.py` 里加了 `fix_argv` 把孤立代理还原，避免 print 时崩
 - 瞬时网络故障会真实发生（实测 02 因 SSL EOF 崩过一次、05 的读超时被重试自愈）；教学脚本 02/03 没有重试，生产用 05
+
+## 待办：monorepo 身份改写（收尾 3）
+
+`/Users/skat/projects`（monorepo `prob-Avahh-real/Projects`）里 132 笔提交仍是旧身份
+（120 笔 `Review <review@local>` + 12 笔 `autoresearch <auto@local>`），在 GitHub 上不会被认领。
+
+改写脚本 `rewrite-history-identity.sh` 已就绪，并在**仿真仓库上端到端验证通过**
+（备份 tag → bundle → stash 工作区 → filter-branch → 旧身份清零校验 → 强推 → 自动恢复工作区）：
+
+```bash
+bash rewrite-history-identity.sh            # 演练（只读）
+bash rewrite-history-identity.sh --apply    # 备份 + 改写 + 强推远端 3 支
+```
+
+未在本会话执行的原因：该仓库位于会话工作目录之外，写入需要沙箱升级批准，多次请求均超时。
